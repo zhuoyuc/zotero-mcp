@@ -547,6 +547,144 @@ def get_item_children(
 
 
 @mcp.tool(
+    name="zotero_get_attachment_path",
+    description=(
+        "Get the local filesystem path(s) of attachment files (PDFs, EPUBs, HTMLs) for a Zotero item. "
+        "Useful when you want to read or analyze the original PDF directly with another tool. "
+        "Resolves both Zotero-managed storage (storage:filename.pdf), linked files (file://, absolute), "
+        "and WebDAV linked attachments (attachments:relative). Returns a markdown table with title, "
+        "content_type, link_mode, resolved local path, and exists flag."
+    )
+)
+def get_attachment_path(
+    item_key: str,
+    content_type_filter: str | None = None,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Args:
+        item_key: parent Zotero item key (8-char)
+        content_type_filter: optional MIME filter, e.g. 'application/pdf' or 'application/epub+zip'
+    """
+    try:
+        ctx.info(f"Resolving attachment paths for {item_key}")
+        zot = _client.get_zotero_client()
+
+        # Parent metadata
+        try:
+            parent = zot.item(item_key)
+            parent_title = parent["data"].get("title", "Untitled")
+        except Exception:
+            parent_title = f"Item {item_key}"
+            parent = None
+
+        # Get children via pyzotero (this is universal — works in local + remote modes)
+        try:
+            children = zot.children(item_key) or []
+        except Exception as e:
+            return f"Error fetching children for {item_key}: {e}"
+
+        attachments = [c for c in children if c.get("data", {}).get("itemType") == "attachment"]
+        if not attachments:
+            return f"No attachments found for: {parent_title} (Key: {item_key})"
+
+        # Try to resolve local paths via LocalZoteroReader (only works in local mode)
+        # Fall back to raw zotero_path if local DB not available.
+        reader = None
+        local_db_available = False
+        try:
+            from zotero_mcp.local_db import LocalZoteroReader, get_local_zotero_reader
+            reader = get_local_zotero_reader()
+            local_db_available = reader is not None
+        except Exception as e:
+            ctx.info(f"Local DB not available: {e}")
+
+        output = [f"# Attachment Paths for: {parent_title}", ""]
+        output.append("| # | Title | Type | Link Mode | Local Path | Exists |")
+        output.append("|---|---|---|---|---|---|")
+
+        rows = 0
+        for i, att in enumerate(attachments, 1):
+            data = att.get("data", {})
+            title = data.get("title", "Untitled").replace("|", "\\|")
+            content_type = data.get("contentType", "")
+            link_mode = data.get("linkMode", "unknown")
+            filename = data.get("filename", "") or ""
+            zotero_path = data.get("path", "") or ""
+            attachment_key = att.get("key", "")
+
+            if content_type_filter and content_type != content_type_filter:
+                continue
+
+            # For imported_url/imported_file (Zotero-managed storage), pyzotero
+            # often returns empty `path` but populates `filename`. Synthesize the
+            # storage: prefix so _resolve_attachment_path() can construct the full path.
+            if not zotero_path and filename and link_mode in ("imported_url", "imported_file"):
+                zotero_path = f"storage:{filename}"
+
+            local_path_str = ""
+            exists_flag = "?"
+
+            if local_db_available and reader and zotero_path:
+                try:
+                    resolved = reader._resolve_attachment_path(attachment_key, zotero_path)
+                    if resolved:
+                        local_path_str = str(resolved)
+                        exists_flag = "✓" if resolved.exists() else "✗"
+                except Exception as e:
+                    ctx.info(f"Path resolution failed for {attachment_key}: {e}")
+
+            if not local_path_str and zotero_path:
+                # Fallback: just show the raw zotero_path (may still be useful for linked files)
+                if zotero_path.startswith("file://") or os.path.isabs(zotero_path):
+                    from urllib.parse import urlparse, unquote
+                    if zotero_path.startswith("file://"):
+                        parsed = urlparse(zotero_path)
+                        local_path_str = unquote(parsed.path or "")
+                    else:
+                        local_path_str = zotero_path
+                    try:
+                        from pathlib import Path as _P
+                        exists_flag = "✓" if _P(local_path_str).exists() else "✗"
+                    except Exception:
+                        exists_flag = "?"
+                else:
+                    local_path_str = f"(unresolved: {zotero_path})"
+                    exists_flag = "?"
+
+            output.append(
+                f"| {i} | {title} | {content_type} | {link_mode} | "
+                f"`{local_path_str or '(no path)'}` | {exists_flag} |"
+            )
+            rows += 1
+
+        if rows == 0:
+            return f"No attachments matching filter (content_type={content_type_filter}) for: {parent_title}"
+
+        if not local_db_available:
+            output.append("")
+            output.append(
+                "> ⚠️ Local Zotero DB not available — paths may not be resolvable for `storage:` "
+                "or `attachments:` link modes. Run in local mode (Zotero desktop app running) "
+                "or check your zotero-mcp config."
+            )
+
+        # Cleanup
+        if reader:
+            try:
+                reader.close()
+            except Exception:
+                pass
+
+        return "\n".join(output)
+
+    except Exception as e:
+        ctx.error(f"Error fetching attachment paths: {str(e)}")
+        return f"Error fetching attachment paths: {str(e)}"
+
+
+@mcp.tool(
     name="zotero_get_items_children",
     description="Get child items (attachments, notes) for MULTIPLE Zotero items in one call. Much more efficient than calling get_item_children repeatedly."
 )
