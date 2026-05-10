@@ -344,6 +344,81 @@ def update_collection(
 
 
 @mcp.tool(
+    name="zotero_delete_item",
+    description=(
+        "Delete an item from your Zotero library. Item is moved to Zotero's Trash "
+        "(recoverable from the Trash bin within the Zotero desktop app). "
+        "Useful for removing mistakenly imported papers. Pass item_key (8-char)."
+    )
+)
+def delete_item(
+    item_key: str,
+    *,
+    ctx: Context
+) -> str:
+    try:
+        read_zot, write_zot = _helpers._get_write_client(ctx)
+    except ValueError as e:
+        return str(e)
+
+    try:
+        item = read_zot.item(item_key)
+        if not item:
+            return f"Item {item_key} not found"
+
+        title = item.get("data", {}).get("title", "?")
+        ctx.info(f"Deleting item {item_key}: {title}")
+
+        result = write_zot.delete_item(item)
+
+        if result is True or result is None:
+            return f"Successfully deleted item `{item_key}` (moved to Trash)\n\n- Title: {title}"
+        return f"Failed to delete item: {result}"
+
+    except Exception as e:
+        ctx.error(f"Error deleting item: {e}")
+        return f"Error deleting item: {e}"
+
+
+@mcp.tool(
+    name="zotero_delete_collection",
+    description=(
+        "Delete a collection from your Zotero library. Collection container is removed; "
+        "items inside are NOT deleted (they remain in the library, just unassigned from "
+        "this collection). Useful for cleaning up empty/archived collections. "
+        "Pass collection_key (8-char)."
+    )
+)
+def delete_collection(
+    collection_key: str,
+    *,
+    ctx: Context
+) -> str:
+    try:
+        read_zot, write_zot = _helpers._get_write_client(ctx)
+    except ValueError as e:
+        return str(e)
+
+    try:
+        coll = read_zot.collection(collection_key)
+        if not coll:
+            return f"Collection {collection_key} not found"
+
+        name = coll.get("data", {}).get("name", "?")
+        ctx.info(f"Deleting collection {collection_key}: {name}")
+
+        result = write_zot.delete_collection(coll)
+
+        if result is True or result is None:
+            return f"Successfully deleted collection `{collection_key}`\n\n- Name: {name}\n- Items inside collection: not deleted (still in library, just unassigned from this collection)"
+        return f"Failed to delete collection: {result}"
+
+    except Exception as e:
+        ctx.error(f"Error deleting collection: {e}")
+        return f"Error deleting collection: {e}"
+
+
+@mcp.tool(
     name="zotero_search_collections",
     description="Search for collections by name to find their keys."
 )
