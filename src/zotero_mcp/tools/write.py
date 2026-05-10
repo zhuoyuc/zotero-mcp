@@ -268,6 +268,82 @@ def create_collection(
 
 
 @mcp.tool(
+    name="zotero_update_collection",
+    description=(
+        "Rename or reparent an existing collection. Provide collection_key (8-char) and "
+        "either new_name (rename) or new_parent_collection (move to a different parent). "
+        "Pass new_parent_collection='' (empty string) to make a collection top-level. "
+        "Use zotero_search_collections to find collection keys."
+    )
+)
+def update_collection(
+    collection_key: str,
+    new_name: str | None = None,
+    new_parent_collection: str | None = None,
+    *,
+    ctx: Context
+) -> str:
+    try:
+        read_zot, write_zot = _helpers._get_write_client(ctx)
+    except ValueError as e:
+        return str(e)
+
+    if not new_name and new_parent_collection is None:
+        return "Provide at least one of: new_name, new_parent_collection"
+
+    try:
+        coll = read_zot.collection(collection_key)
+        if not coll:
+            return f"Collection {collection_key} not found"
+
+        old_data = coll.get("data", {}) or {}
+        old_name = old_data.get("name", "?")
+        old_parent = old_data.get("parentCollection", False)
+        version = coll.get("version") or old_data.get("version")
+
+        # Build full payload (Zotero API requires full data block on PATCH/PUT)
+        payload = {
+            "key": collection_key,
+            "version": version,
+            "name": old_data.get("name", ""),
+            "parentCollection": old_parent,
+        }
+
+        changes = []
+        if new_name:
+            payload["name"] = new_name
+            changes.append(f"name: '{old_name}' → '{new_name}'")
+        if new_parent_collection is not None:
+            if new_parent_collection and not re.match(r'^[A-Z0-9]{8}$', new_parent_collection):
+                try:
+                    keys = _helpers._resolve_collection_names(read_zot, [new_parent_collection], ctx=ctx)
+                    parent_key = keys[0] if keys else False
+                except ValueError as e:
+                    return f"Error resolving new parent collection: {e}"
+            else:
+                parent_key = new_parent_collection if new_parent_collection else False
+            payload["parentCollection"] = parent_key
+            changes.append(f"parent: '{old_parent or 'top'}' → '{parent_key or 'top'}'")
+
+        ctx.info(f"Updating collection {collection_key}: {'; '.join(changes)}")
+
+        # pyzotero update_collection PATCH
+        result = write_zot.update_collection(payload)
+
+        # pyzotero returns True on success or raises on failure
+        if result is True or result is None or (isinstance(result, dict) and not result.get("failed")):
+            return (
+                f"Successfully updated collection `{collection_key}`\n\n"
+                + "\n".join(f"- {c}" for c in changes)
+            )
+        return f"Failed to update collection: {result}"
+
+    except Exception as e:
+        ctx.error(f"Error updating collection: {e}")
+        return f"Error updating collection: {e}"
+
+
+@mcp.tool(
     name="zotero_search_collections",
     description="Search for collections by name to find their keys."
 )
@@ -393,7 +469,7 @@ def add_by_doi(
     doi: str,
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
-    attach_mode: str = "auto",
+    attach_mode: str = "linked_url",
     *,
     ctx: Context
 ) -> str:
@@ -545,7 +621,7 @@ def add_by_url(
     url: str,
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
-    attach_mode: str = "auto",
+    attach_mode: str = "linked_url",
     *,
     ctx: Context
 ) -> str:
@@ -568,7 +644,7 @@ def add_by_url(
         # arXiv URL routing
         arxiv_id = _helpers._normalize_arxiv_id(url)
         if arxiv_id:
-            return _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx)
+            return _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode=attach_mode)
 
         # Generic webpage
         ctx.info(f"Creating webpage item for: {url}")
@@ -599,7 +675,7 @@ def add_by_url(
         return f"Error adding by URL: {e}"
 
 
-def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx):
+def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="linked_url"):
     """Add an arXiv paper by ID. Internal helper for add_by_url."""
     ctx.info(f"Fetching arXiv metadata for: {arxiv_id}")
 
@@ -678,26 +754,38 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx):
     if isinstance(result, dict) and result.get("success"):
         item_key = next(iter(result["success"].values()))
 
-        # arXiv always has a free PDF — try to attach it
+        # arXiv always has a free PDF — handle per attach_mode (default linked_url to avoid Zotero storage quota)
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
         pdf_status = "no PDF attached"
-        try:
-            pdf_resp = requests.get(pdf_url, timeout=30, stream=True)
-            pdf_resp.raise_for_status()
-            with tempfile.TemporaryDirectory() as tmpdir:
-                filename = f"arxiv_{arxiv_id.replace('/', '_')}.pdf"
-                filepath = os.path.join(tmpdir, filename)
-                with open(filepath, "wb") as f:
-                    for chunk in pdf_resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                write_zot.attachment_both(
-                    [(filename, filepath)],
-                    parentid=item_key,
-                )
-            pdf_status = "PDF attached"
-        except Exception as e:
-            ctx.info(f"arXiv PDF attachment failed (non-fatal): {e}")
-            pdf_status = f"no PDF attached ({e})"
+        if attach_mode == "none":
+            pdf_status = "PDF attach skipped (attach_mode=none)"
+        elif attach_mode == "linked_url":
+            try:
+                if _helpers._attach_pdf_linked_url(write_zot, pdf_url, item_key, ctx):
+                    pdf_status = "PDF linked (URL only, source: arXiv)"
+                else:
+                    pdf_status = "PDF link failed"
+            except Exception as e:
+                ctx.info(f"arXiv PDF link failed (non-fatal): {e}")
+                pdf_status = f"PDF link failed ({e})"
+        else:  # "auto" or "import_file" — try file upload (may hit Zotero storage quota)
+            try:
+                pdf_resp = requests.get(pdf_url, timeout=30, stream=True)
+                pdf_resp.raise_for_status()
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    filename = f"arxiv_{arxiv_id.replace('/', '_')}.pdf"
+                    filepath = os.path.join(tmpdir, filename)
+                    with open(filepath, "wb") as f:
+                        for chunk in pdf_resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    write_zot.attachment_both(
+                        [(filename, filepath)],
+                        parentid=item_key,
+                    )
+                pdf_status = "PDF attached"
+            except Exception as e:
+                ctx.info(f"arXiv PDF attachment failed (non-fatal): {e}")
+                pdf_status = f"no PDF attached ({e})"
 
         return (
             f"Successfully added arXiv paper: **{title}**\n\n"
